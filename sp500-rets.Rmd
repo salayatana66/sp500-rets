@@ -1,0 +1,342 @@
+---
+title: "Modeling SP500 daily returns"
+author: "Andrea Schioppa"
+output:
+  html_document:
+    keep_md: yes
+---
+
+## Synopsis
+
+We use the data set sp500.dta available from [Verbeek's data sets](http://bcs.wiley.com/he-bcs/Books?action=resource&bcsId=7080&itemId=1119951674&resourceId=27088) (Chapter 8), which contains daily returs on the SP500
+index from January 1981 to April 1991 ($T = 2783$), to illustrate the choice of an autoregressive model.
+
+## Loading the data and creating a plot
+
+```{r libraries, echo = TRUE}
+library(foreign)
+library(ggplot2)
+library(lubridate)
+library(scales)
+library(zoo)
+library(forecast)
+library(rugarch)
+```
+
+We load the data and make a plot. Note the October 19, 1987 crash.
+
+```{r load_plot}
+sp500 <- read.dta('../sp500.dta')
+sp500$T <- c(1:dim(sp500)[1])
+sp500$date <- seq(as.Date('1981-01-01'), as.Date('1991-04-01'), length.out = dim(sp500)[1])
+
+p <- ggplot(sp500, aes(x=date, y=r500)) + geom_line()
+p <- p + labs(x = 'Date', y ='SP500')
+p
+```
+We also make a plot of the autocorrelation and the partial autocorrelations.
+
+```{r autocorrs, echo = TRUE}
+# convert to time series
+ts500 <- zoo(sp500$r500, sp500$date)
+
+# auto/partial correlation
+acf_ts500 <- acf(ts500, lag.max = 50) # exclude autocorrelation
+pacf_ts500 <- pacf(ts500, lag.max = 50) 
+```
+From the autocorrelation we decide to exclude moving average terms.
+
+
+
+## Fitting AR(p) models
+
+We fit AR(p) models for $p\in\{1,\ldots,7\}$. We then compute p-values for individual coefficients
+under a normality assumption (it might be more rigorous to estimate robust errors).
+
+```{r individual_sig, echo = TRUE}
+# fit AR(1)--AR(7) models
+armodels <- list()
+for(i in 1:7) {
+    armodels[[paste('AR(', i, ')', sep = '')]] <- arima(ts500, order = c(i,0,0))
+}
+
+# construct pvals for individual coefficients
+# note: we compute asymmetric ones, with just one tail
+arpvals <- lapply(armodels, function(x) {
+    out <- data.frame(z = x$coef/sqrt(diag(x$var.coef)), row.names = names(x$coef))
+    out$pval = pnorm(abs(out$z), lower.tail=F)
+    out
+}) # based
+
+arpvals
+```
+
+From the list AR(5) seems a reasonable guess. The function `Constraint_Test` implements
+joint significance tests for the coefficients. The tests are Lagrange Multiplier (LM),
+LogLikelihood Ratio (LR) and Wald (W). The lexicographic ordering $\text{LM}\le\text{LR}\le\text{W}$
+holds.
+
+```{r joint_sig, echo = TRUE}
+# construct pvals for joint testing
+Constraint_Test <- function(x, sigma2) {
+    N.obs <- x$nobs
+    N.df <- length(x$coef) - 1
+
+    out <- data.frame(Stat = c(N.obs * (sigma2-x$sigma2) / sigma2,
+                               N.obs * log(sigma2 / x$sigma2),
+                               N.obs * (sigma2-x$sigma2) / x$sigma2))
+    rownames(out) <- c('LM', 'LR', 'W')
+    out$Pval <- apply(out, 1, pchisq, df = N.df, lower.tail = FALSE)
+
+    out
+}
+
+ar_joint_pvals <- lapply(armodels, Constraint_Test, sigma2 = var(sp500$r500))
+ar_joint_pvals
+```
+
+
+## Ljung-Box Test
+We implement a Ljung-Box Test for the residuals of the models we fitted. The goal is to detect
+significant autocorrelations. The Ljung-Box test statistic is a $\chi^2$ with the degrees of freedom
+depending on how many lagged autocorrelations ($K$) we use. Note that
+if $K$ is too small the statistic is `NA`. We used $K=6, 12, 18$. The null-hypothesis of the test
+is that errors are not serially correlated. There seems to be evidence that 5-lags are needed to
+uncorrelate the errors.
+
+```{r LjBx_test, echo = TRUE}
+Ljung_Box_Test <- function(x, K) {
+    T <- x$nobs
+    ndf <- K - (length(x$coef) - 1)
+    if(ndf <= 0 || T <= K) return(NA) # can't apply the statistics
+
+    # autocorrelations
+    rk <- acf(x$residuals, lag.max = K, plot = FALSE)
+    rk <- as.numeric(rk$acf)[-1] # first is lag = 0
+    
+    
+    # weights
+    wk <- 1/(T-c(1:K))
+
+    # Q-statistic
+    Q <- T * (T+2) * sum(wk * rk^2)
+
+    return(pchisq(Q, df = ndf, lower.tail = FALSE))
+}
+
+Kvec <- c(6, 12, 18)
+arlj_pvals <- matrix(0, nrow = length(armodels), ncol = length(Kvec))
+rownames(arlj_pvals) <- names(armodels)
+colnames(arlj_pvals) <- paste('K =', Kvec)
+
+for(i in 1:length(Kvec)) {
+    arlj_pvals[,i] <- sapply(armodels, Ljung_Box_Test, K = Kvec[i])
+}
+
+arlj_pvals
+```
+
+
+## Information Criteria
+To assist in choosing a model we apply the AIC/BIC criteria.
+
+```{r info_crit1, echo = TRUE}
+ar_infcr <- matrix(0, nrow = length(armodels), ncol = 2)
+rownames(ar_infcr) <- names(armodels)
+colnames(ar_infcr) <- c('AIC', 'BIC')
+ar_infcr[, 1] <- unlist(sapply(armodels, `[`, 'aic'))
+ar_infcr[, 2] <- sapply(armodels, BIC)
+
+ar_infcr
+```
+
+AIC suggests AR(5) while BIC AR(1), but we know that AR(1) fails to eliminate the serial correlation in the
+residuals. We go for AR(5), but we saw before that not all coefficients seem significant. So we fit nested
+models to make a choice. 
+
+```{r nested, echo = TRUE}
+arnewmod <- list()
+arnewmod[[1]] <- arima(ts500, order = c(5,0,0), fixed = c(NA, 0, 0, 0, NA, NA)) # NA = free;
+# last is intercept
+arnewmod[[2]] <- arima(ts500, order = c(5,0,0), fixed = c(NA, NA, 0, 0, NA, NA))
+arnewmod[[3]] <- arima(ts500, order = c(5,0,0), fixed = c(NA, NA, NA, 0, NA, NA))
+arnewmod[[4]] <- arima(ts500, order = c(5,0,0))
+
+# construct pvals for individual coefficients
+arnewpvals <- lapply(arnewmod, function(x) {
+    null.coef <- which(x$coef == 0)
+    if(length(null.coef)>0) {
+        out <- data.frame(z = x$coef[-null.coef]/sqrt(diag(x$var.coef)), row.names = names(x$coef[-null.coef]))
+    } else {
+        out <- data.frame(z = x$coef/sqrt(diag(x$var.coef)), row.names = names(x$coef))
+    }
+    out$pval = pnorm(abs(out$z), lower.tail=F)
+    out
+})
+
+arnewpvals
+
+arnew_infcr <- matrix(0, nrow = length(arnewmod), ncol = 2)
+rownames(arnew_infcr) <- names(arnewmod)
+colnames(arnew_infcr) <- c('AIC', 'BIC')
+arnew_infcr[, 1] <- unlist(sapply(arnewmod, `[`, 'aic'))
+arnew_infcr[, 2] <- sapply(arnewmod, BIC)
+
+arnew_infcr
+```
+The AIC suggests the model with all coefficients unconstrained while the BIC with the second, third and
+fourth to zero. On the other hand, at $1\%$-significance (we choose this because we are not
+using robust standard errors) the coefficient of the second term is significant. Finally
+also the intercept does not appear significant. Hence
+we fit as final model the one with only the third and fourth coefficients set to $0$ and without
+an intercept.  We compare it with
+the choice made by the automatic algorithm selection in the `forecast` package.
+
+```{r final_model, echo = TRUE}
+# Use Hyndman's automatic selection
+hyndman_choice <- auto.arima(ts500, max.p = 7, max.q = 0)
+# chooses an AR(2)
+
+# My choice
+arfinal <- arima(ts500, order = c(5,0,0), fixed = c(NA, NA, 0, 0, NA, 0))
+
+hyndman_choice
+
+arfinal
+```
+
+
+## The Breutsch-Pagan Test
+
+We now test for autoregressive heteroskedasticity in the residuals. If errors are heteroskedastic,
+we need more efficient estimators. We implement the Breutsch-Pagan Test; we first tried to use
+`arima` to write less code, but it gave the wrong results, so we explicitly implement the regressions.
+The relative statistic compares each model with the previous one.
+
+```{r breutsch_pagan, echo = TRUE}
+BreutschPagan <- function(model, p = 7) { # test up to AR(p) in res^2
+    res2 <- model$residuals^2
+    T <- model$nobs
+    
+    bpModels <- list()
+    for(i in 1:p) {
+        bpModels[[i]] <- arima(res2, order = c(i, 0, 0))
+    }
+
+    sigma2 <- var(res2)
+
+    out <- matrix(0, nrow = p, ncol = 4)
+    rownames(out) <- paste('HetAR(', c(1:p), ')', paste = '')
+    colnames(out) <- c('Stat', 'Pval', 'RelStat', 'RelPval') # Rel = 1 model compared to the previous one
+
+    out[,'Stat'] <- T * (sigma2 - sapply(bpModels, `[[`, 'sigma2')) / sigma2
+    out[, 'Pval'] <- pchisq(out[,'Stat'], df = c(1:p), lower.tail = FALSE) # vectorize pchisq
+
+    out[1, 'RelStat'] <- NA
+    out[1, 'RelPval'] <- NA
+
+    out[-1, 'RelStat'] <- T * (sapply(bpModels, `[[`, 'sigma2')[-p] - sapply(bpModels, `[[`, 'sigma2')[-1]) / (
+        sapply(bpModels, `[[`, 'sigma2')[p])
+    out[-1, 'RelPval'] <- pchisq(out[-1,'RelStat'], df = 1, lower.tail = FALSE) # vectorize pchisq
+    
+    out
+}
+
+arBP <- BreutschPagan(model = arfinal, p = 10)
+
+arBP
+```
+
+If we want to use a regressive heteroskedasticity model we should use at least $5$ lags.
+
+
+## ARCH(5)-model
+We fit an ARCH(5)-model using the `rugarch` package.
+
+
+```{r arch, echo = TRUE}
+# Heteroskedasticity seems significant up to order 5
+
+# specify model; sGARCH = plain GARCH
+archSpec <- ugarchspec(variance.model = list(model = 'sGARCH', garchOrder = c(0,5)),
+                       mean.model = list(armaOrder = c(5,0)))
+# add constraints mu = ar3 = ar4 = 0
+setfixed(archSpec)<-list(mu = 0, ar3=0, ar4=0)
+# fit
+archmod <- ugarchfit(archSpec, data = ts500)                                             
+
+# compare result
+print(archmod@fit$coef)
+print(archmod@fit$se.coef)
+print(arfinal$coef)
+print(sqrt(diag(arfinal$var.coef)))
+```
+
+We see an agreement of the coefficients and their standard errors in the two models.
+
+
+## GARCH(1,1)-model
+We now fit a GARCH(1,1)-model. The smoothing term would have the efferct of needing less
+autoregressive terms.
+
+```{r garch, echo = TRUE}
+# specify
+garchSpec <- ugarchspec(variance.model = list(model = 'sGARCH', garchOrder = c(1,1)),
+                        mean.model = list(armaOrder = c(5,0)))
+setfixed(garchSpec) <- list(mu = 0, ar3 = 0, ar4 = 0)
+# fit
+garchmod <- ugarchfit(garchSpec, data = ts500, solver = 'nloptr', solver.control = list(solver = 9))
+# compare result
+print(garchmod@fit$coef)
+print(garchmod@fit$se.coef)
+print(arfinal$coef)
+print(sqrt(diag(arfinal$var.coef)))
+
+alpha_beta <- garchmod@fit$coef['alpha1'] + garchmod@fit$coef['beta1']
+
+alpha_beta
+```
+
+There is less agreement with the coefficients of `arfinal`, in particular for the autoregressive term
+of order $5$. Note that `alpha1+beta1` is close to $1$, suggesting strong persistence of the shocks.
+
+
+## EGARCH-model
+
+We finally fit an EGARCH-model. This allows for the sign of the shock to have an effect on the volatility.
+
+```{r egarch, echo = TRUE}
+# specify
+egarchSpec <- ugarchspec(variance.model = list(model = 'eGARCH', garchOrder = c(1,1)),
+                        mean.model = list(armaOrder = c(5,0)))
+setfixed(egarchSpec) <- list(mu = 0, ar3 = 0, ar4 = 0)
+# fit
+# tweak the solver for convergence; standard option does NOT converge
+egarchmod <- ugarchfit(egarchSpec, data = ts500, solver = 'nloptr', solver.control = list(solver = 9))
+# parameter alpha1 = (gamma in Verbeek) < 0: asymmetry of the shocks
+# compare result
+print(egarchmod@fit$coef)
+print(egarchmod@fit$se.coef)
+print(arfinal$coef)
+print(sqrt(diag(arfinal$var.coef)))
+```
+
+Note that `alpha1` is negative and captures the sign effect (one has to check on the [vignette](https://cran.r-project.org/web/packages/rugarch/vignettes/Introduction_to_the_rugarch_package.pdf), pg. 7). The notation
+is inconsistent, elsewhere the sign effect is denoted by $\gamma$. Anyway, we see that negative shocks
+have a greater effect on increasing volatility.
+
+
+
+## Final Choice
+For the final choice we use the information criteria.
+```{r final_choice, echo = TRUE}
+# Summarize infoCriteria
+
+infoSummary <- data.frame(cbind(infocriteria(archmod),infocriteria(garchmod)), infocriteria(egarchmod))
+colnames(infoSummary) <- c('ARCH', 'GARCH', 'EGARCH')
+
+infoSummary
+```
+
+All criteria prefer the EGARCH model.
+
